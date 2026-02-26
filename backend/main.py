@@ -56,7 +56,9 @@ def generate_cold_message(name, summary):
     try:
         prompt = f"""
         Write a LinkedIn note from Louis Cui to {name}. 
-        Louis: MIT Master of Business Analytics, NYU Math/DS alum.
+        The tone should be warm, passionate, and concise. 
+        Most importantly, the way of writing the note should be like a conversation.
+        Louis: MIT Master of Business Analytics, NYU Math/DS Graduate.
         Prospect: {summary}
         If MIT/NYU alum, mention it first. Keep under 280 chars.
         """
@@ -98,79 +100,97 @@ def run_agent_api(request: SearchRequest):
             page.click("button[type='submit']")
             page.wait_for_url("**/feed/**", timeout=30000)
 
-            log_debug(f"Searching: {request.keyword}")
-            search_url = f"https://www.linkedin.com/search/results/people/?keywords={request.keyword.replace(' ', '%20')}"
-            page.goto(search_url)
+            # ---------------------------------------------------------
+            # 核心修改区：加入翻页循环。这里设置为抓取 1 到 10 页
+            # ---------------------------------------------------------
+            MAX_PAGES = 10 
             
-            # --- 关键：强制滚动以加载 2nd/3rd 标签 ---
-            for _ in range(3):
-                page.mouse.wheel(0, 800)
-                time.sleep(2)
+            for current_page in range(1, MAX_PAGES + 1):
+                log_debug(f"========== 正在搜索: {request.keyword} | 第 {current_page} 页 ==========")
+                
+                # 领英搜索支持在 URL 中直接指定 page 参数
+                search_url = f"https://www.linkedin.com/search/results/people/?keywords={request.keyword.replace(' ', '%20')}&page={current_page}"
+                page.goto(search_url)
+                
+                # 强制滚动以加载页面底部的动态内容
+                for _ in range(3):
+                    page.mouse.wheel(0, 800)
+                    time.sleep(2)
 
-            # --- 关键：暴力提取所有非 1st 链接 ---
-            people_list = page.evaluate("""() => {
-                const results = [];
-                const links = Array.from(document.querySelectorAll('a[href*="/in/"]'));
-                links.forEach(link => {
-                    const url = link.href.split('?')[0];
-                    const name = link.innerText.trim();
-                    const container = link.closest('.reusable-search__result-container');
-                    const text = container ? container.innerText : "";
-                    
-                    const isFirst = text.includes('• 1st') || text.includes('Message');
-                    if (!isFirst && name.length > 1 && !name.includes('LinkedIn Member') && !url.includes('/in/me/')) {
-                        results.push({ name: name, url: url });
-                    }
-                });
-                return results;
-            }""")
-
-            unique_people = []
-            seen = set()
-            for p_item in people_list:
-                if p_item['url'] not in seen:
-                    seen.add(p_item['url'])
-                    unique_people.append(p_item)
-
-            log_debug(f"Found {len(unique_people)} target leads (non-1st).")
-
-            # 写入 CSV
-            with open(csv_filename, mode='a', newline='', encoding='utf-8') as csv_file:
-                fieldnames = ['Search Keyword', 'Name', 'Headline', 'Profile URL', 'Experience Summary', 'Curated Cold Message']
-                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-                if not os.path.isfile(csv_filename) or os.stat(csv_filename).st_size == 0:
-                    writer.writeheader()
-
-                for person in unique_people[:8]: # 限制单次抓取数量防封
-                    if person['url'] in existing_urls: continue
-                    
-                    try:
-                        log_debug(f"Scraping profile: {person['name']}")
-                        page.goto(person['url'], timeout=60000)
-                        page.wait_for_selector("main", timeout=20000)
-                        time.sleep(random.uniform(3, 5))
+                # 暴力提取所有非 1st 链接
+                people_list = page.evaluate("""() => {
+                    const results = [];
+                    const links = Array.from(document.querySelectorAll('a[href*="/in/"]'));
+                    links.forEach(link => {
+                        const url = link.href.split('?')[0];
+                        const name = link.innerText.trim();
+                        const container = link.closest('.reusable-search__result-container');
+                        const text = container ? container.innerText : "";
                         
-                        profile_text = page.locator("main").inner_text()
-                        summary = summarize_experience(profile_text)
-                        msg = generate_cold_message(person['name'], summary)
-                        
-                        row_data = {
-                            "Search Keyword": request.keyword,
-                            "Name": person['name'],
-                            "Headline": "Target Prospect",
-                            "Profile URL": person['url'],
-                            "Experience Summary": summary,
-                            "Curated Cold Message": msg
+                        const isFirst = text.includes('• 1st') || text.includes('Message');
+                        if (!isFirst && name.length > 1 && !name.includes('LinkedIn Member') && !url.includes('/in/me/')) {
+                            results.push({ name: name, url: url });
                         }
-                        writer.writerow(row_data)
-                        csv_file.flush()
-                        results_list.append(row_data)
-                    except:
-                        log_debug(f"Failed to scrape {person['name']}")
-                        continue
+                    });
+                    return results;
+                }""")
 
+                unique_people = []
+                seen = set()
+                for p_item in people_list:
+                    if p_item['url'] not in seen:
+                        seen.add(p_item['url'])
+                        unique_people.append(p_item)
+
+                log_debug(f"在第 {current_page} 页找到 {len(unique_people)} 个目标 (非 1st).")
+                
+                # 如果这一页没有任何人，直接跳出大循环（说明翻到底了）
+                if len(unique_people) == 0:
+                    log_debug("当前页面未找到更多联系人，停止翻页。")
+                    break
+
+                # 写入 CSV（去掉了原本 [:8] 的限制，全部抓取）
+                with open(csv_filename, mode='a', newline='', encoding='utf-8') as csv_file:
+                    fieldnames = ['Search Keyword', 'Name', 'Headline', 'Profile URL', 'Experience Summary', 'Curated Cold Message']
+                    writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                    if not os.path.isfile(csv_filename) or os.stat(csv_filename).st_size == 0:
+                        writer.writeheader()
+
+                    for person in unique_people: 
+                        if person['url'] in existing_urls: 
+                            log_debug(f"跳过已存在的用户: {person['name']}")
+                            continue
+                        
+                        try:
+                            log_debug(f"Scraping profile: {person['name']}")
+                            page.goto(person['url'], timeout=60000)
+                            page.wait_for_selector("main", timeout=20000)
+                            time.sleep(random.uniform(3, 5))
+                            
+                            profile_text = page.locator("main").inner_text()
+                            summary = summarize_experience(profile_text)
+                            msg = generate_cold_message(person['name'], summary)
+                            
+                            row_data = {
+                                "Search Keyword": request.keyword,
+                                "Name": person['name'],
+                                "Headline": "Target Prospect",
+                                "Profile URL": person['url'],
+                                "Experience Summary": summary,
+                                "Curated Cold Message": msg
+                            }
+                            writer.writerow(row_data)
+                            csv_file.flush() # 极其关键：实时写入硬盘，哪怕中途崩溃也能保存
+                            results_list.append(row_data)
+                            existing_urls.add(person['url'])
+                            
+                        except Exception as e:
+                            log_debug(f"Failed to scrape {person['name']}: {str(e)}")
+                            continue
+                            
+            # 整个循环结束
             browser.close()
-            return {"status": "success", "data": results_list}
+            return {"status": "success", "data": results_list, "total_scraped": len(results_list)}
 
         except Exception as e:
             log_debug(f"Crash: {str(e)}")
